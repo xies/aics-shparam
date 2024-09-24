@@ -4,6 +4,7 @@ import numpy as np
 from vtk.util import numpy_support
 from skimage import transform as sktrans
 from scipy import interpolate as spinterp
+import pyvista as pv
 
 from . import shtools
 
@@ -15,6 +16,7 @@ def get_shcoeffs(
     compute_lcc: bool = True,
     alignment_2d: bool = True,
     make_unique: bool = False,
+    POINT_CLOUD: bool = False,
 ):
     """
     Compute spherical harmonics coefficients that describe an object stored as
@@ -32,6 +34,8 @@ def get_shcoeffs(
     ----------
     image : ndarray
         Input image. Expected to have shape ZYX.
+        Optionally, could be a Nx3 array of point cloud coordinates, if POINT_CLOUD
+        is set to True.
     lmax : int
         Order of the spherical harmonics parametrization. The higher the order
         the more shape details are represented.
@@ -70,6 +74,11 @@ def get_shcoeffs(
         Whether the image should be aligned in 2d. Default is True.
     make_unique : bool
         Set true to make sure the alignment rotation is unique.
+        
+    POINT_CLOUD : bool, optional
+        Default is False. Use pyvista.PolyDataFilters.reconstruct_surface()
+        for initial mesh reconstruction from point clouds.
+
 
     Notes
     -----
@@ -107,35 +116,50 @@ def get_shcoeffs(
         >>> Error: 2.3738182456948795
     """
 
-    if len(image.shape) != 3:
+    if len(image.shape) != 3 and POINT_CLOUD == False:
         raise ValueError(
             "Incorrect dimensions: {}. Expected 3 dimensions.".format(image.shape)
         )
 
-    if image.sum() == 0:
+    if image.sum() == 0 and POINT_CLOUD == False:
         raise ValueError("No foreground voxels found. Is the input image empty?")
+    
+    if len(image) == 0 and POINT_CLOUD == True:
+        raise ValueError('Input is point cloud but no points found.')
+    
+    if image.shape[1] != 3 and POINT_CLOUD == True:
+        raise ValueError('Nx3 point cloud coordinates expected')
 
-    # Binarize the input. We assume that everything that is not background will
-    # be use for parametrization
-    image_ = image.copy()
-    image_[image_ > 0] = 1
+    if not POINT_CLOUD:
+        # Binarize the input. We assume that everything that is not background will
+        # be use for parametrization
+        image_ = image.copy()
+        image_[image_ > 0] = 1
+    
+        # Alignment
+        if alignment_2d:
+            # Align the points such that the longest axis of the 2d
+            # xy max projected shape will be horizontal (along x)
+            image_, angle = shtools.align_image_2d(image=image_, make_unique=make_unique)
+            image_ = image_.squeeze()
+            
+        # Converting the input image into a mesh using regular marching cubes
+        mesh, image_, centroid = shtools.get_mesh_from_image(image=image_, sigma=sigma)
+        
+    else:
+        image_ = image.copy()
+        # Not sure abt align2d??
+        points = pv.wrap(image)
+        centroid = image_.mean(axis=0)
+        mesh = points.reconstruct_surface()
 
-    # Alignment
-    if alignment_2d:
-        # Align the points such that the longest axis of the 2d
-        # xy max projected shape will be horizontal (along x)
-        image_, angle = shtools.align_image_2d(image=image_, make_unique=make_unique)
-        image_ = image_.squeeze()
-
-    # Converting the input image into a mesh using regular marching cubes
-    mesh, image_, centroid = shtools.get_mesh_from_image(image=image_, sigma=sigma)
-
-    if not image_[tuple([int(u) for u in centroid[::-1]])]:
-        warnings.warn(
-            "Mesh centroid seems to fall outside the object. This indicates\
-        the mesh may not be a manifold suitable for spherical harmonics\
-        parameterization."
-        )
+    if not POINT_CLOUD:
+        if not image_[tuple([int(u) for u in centroid[::-1]])]:
+            warnings.warn(
+                "Mesh centroid seems to fall outside the object. This indicates\
+            the mesh may not be a manifold suitable for spherical harmonics\
+            parameterization."
+            )
 
     # Get coordinates of mesh points
     coords = numpy_support.vtk_to_numpy(mesh.GetPoints().GetData())
@@ -143,7 +167,11 @@ def get_shcoeffs(
     y = coords[:, 1]
     z = coords[:, 2]
 
-    transform = centroid + ((angle,) if alignment_2d else ())
+    if not POINT_CLOUD:
+        transform = centroid + ((angle,) if alignment_2d else ())
+    else:
+        transform = centroid
+    
 
     # Translate and update mesh normals
     mesh = shtools.update_mesh_points(mesh, x, y, z)
@@ -152,6 +180,7 @@ def get_shcoeffs(
     rad = np.sqrt(x**2 + y**2 + z**2)
     lat = np.arccos(np.divide(z, rad, out=np.zeros_like(rad), where=(rad != 0)))
     lon = np.pi + np.arctan2(y, x)
+    
 
     # Creating a meshgrid data from (lon,lat,r)
     points = np.concatenate(
